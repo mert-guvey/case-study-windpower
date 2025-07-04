@@ -1,0 +1,902 @@
+---
+title: "Wind Farm Analysis"
+author: "Mert Güvey"
+date: "2025-07-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 15, fig.height = 10)
+```
+
+```{r PREP load}
+library(data.table)
+library(ggplot2)
+library(patchwork)
+```
+
+```{r PREP csv}
+import_initial <- fread("Data_Wind.csv", colClasses = c(index = "POSIXct", site = "factor"))
+metadata_farms <- fread("Metadata.csv", colClasses = c(id = "factor"))
+```
+
+```{r PREP panel_farms}
+panel_farms <-
+  copy(import_initial) |>
+    setnames(
+      old = colnames(import_initial)[3:8],
+      new = c("power", "temp", "angle", "rotor_speed", "direction", "wind_speed")
+      ) |>
+    _[
+      expand.grid(
+        index = 
+          seq.POSIXt(
+            from = import_initial[, min(index)], 
+            to = import_initial[, max(index)], 
+            by = "hour"
+            ),
+        site = 
+          as.factor(1:4)
+      ),
+      on = .NATURAL
+      ] |>
+    _[,
+      `:=`(
+        year = year(index),
+        month = month(index),
+        m_day = mday(index),
+        hour = hour(index),
+        wind = direction | wind_speed
+        )
+      ]
+```
+
+```{r PREP add cap util & time of day}
+panel_farms |>
+  _[
+    metadata_farms[, list(id, cap = `Capacity KWh`)],
+    `:=`(
+      cap_util = round(pmax(0, power) / cap, 2), 
+      time_of_day = 
+        fcase(
+          hour %in% c(22, 23, 0, 1, 2, 3), "10PM-3AM", 
+          hour %in% 4:9, "4AM-9AM", 
+          hour %in% 10:15, "10AM-3PM", 
+          hour %in% 16:21, "4PM-9PM"
+          )
+      ),
+    on = "site == id"
+    ] |>
+  _[,
+    time_of_day := ordered(time_of_day, levels = c("4AM-9AM", "10AM-3PM", "4PM-9PM", "10PM-3AM"))
+    ]
+```
+
+```{r PREP hdelta, include=FALSE}
+panel_hdelta <-
+  copy(panel_farms) |>
+  _[,
+    names(.SD) := lapply(.SD, \(col) col - shift(col, type = "lag")),
+    .SDcols = c("power", "temp", "angle", "direction", "wind_speed", "cap_util")
+    ]
+```
+
+```{r PREP panel_rolling}
+panel_rolling <-
+  panel_farms |>
+    _[
+      index > as.POSIXct("2021-04-15", tz = "GMT"),
+      list(
+        index,
+        temp_daily = frollmean(temp, n = 24L, align = "right", na.rm = TRUE, hasNA = TRUE),
+        temp_seasonal = frollmean(temp, n = 720L, align = "right", na.rm = TRUE, hasNA = TRUE),
+        wind_daily = frollmean(wind_speed, n = 24L, align = "right", na.rm = TRUE, hasNA = TRUE),
+        wind_seasonal = frollmean(wind_speed, n = 720L, align = "right", na.rm = TRUE, hasNA = TRUE),
+        power_daily = scale(frollsum(power, n = 24L, align = "right", na.rm = TRUE, hasNA = TRUE), center = FALSE),
+        speed_daily = scale(frollmean(rotor_speed, n = 24L, align = "right", na.rm = TRUE, hasNA = TRUE), center = FALSE)
+        ),
+      by = site
+      ]
+```
+
+```{r PREP cardinality label vector, echo=FALSE}
+cardinal_directions <- c("E", "NE", "N", "NW", "W", "SW", "S", "SE")
+```
+
+```{r PREP add cardinality}
+panel_farms |>
+  _[
+    wind == FALSE,
+    direction := NA
+    ] |>
+  _[,
+    cardinality :=
+      fcase(
+        direction < 45, "E",
+        direction < 90, "NE",
+        direction < 135, "N",
+        direction < 180, "NW",
+        direction < 225, "W",
+        direction < 270, "SW",
+        direction < 315, "S",
+        direction < 360, "SE"
+        )
+    ] |>
+  _[,
+    cardinality := ordered(cardinality, levels = c("E", "NE", "N", "NW", "W", "SW", "S", "SE"))
+    ]
+```
+
+## Introduction
+
+In their article *Historical Hourly Information of Four European Wind Farms for Wind Energy Forecasting and Maintenance*, Sanchez-Soriano et al. provide data regarding four European wind farms and elaborate on the methodology of collection, modelling and possible uses. Looking at such parameters as wind speed, rotor speed, and power generation, I make comparisons on the basis of site, time of day, wind direction etc. and aim to gain a better understanding of the factors involved in achieving optimal capacity utilization.
+
+The four sites have differing turbine counts and capacities. They are also located relatively close together, despite being on three different countries. Sites 1 and 2 have low turbine counts but high per-turbine capacity, whereas site 3 has many low-capacity turbines. Site 4 has more turbines and capacity than sites 1 and 2, but low per-turbine capacity.
+
+```{r PROD overview}
+metadata_farms[, list(ID = id, `Turbine Count` = Wind_generator_number, `Capacity KWh`, Latitude = latitude, Longitude = longitude, Jurisdiction = State, Country)]
+```
+
+## Overview
+
+Data has been collected over a period of three years from four wind farms in Europe [1], although significant gaps are present in the time series. From the end of December 2021 to the end of August 2022, no data is reported for any of the sites. The same is true for September 2023. For individual sites, missingness follows similar patterns among sites 1, 2 and 4; with the caveat that site 4 does not have any data available before April 14, 2021. Site 3 diverges from remaining sites on some individual missing timestamps, with an additional gap of one month during the period of March-April 2023. Although limitations imposed by missing periods is considerable, ample data is nevertheless available for all months and hours of day, making it possible to draw comparisons on the basis of season or time of day.
+
+```{r EXP missing, fig.width=4, fig.height=4}
+lapply(split(panel_farms, ~ site), \(dt) visdat::vis_miss(dt[, list(wind)]))
+```
+
+It appears that for site 4, a single value is provided for rotor speed and nacelle angle due to erroneous data collection or confidentiality reasons. I have taken care to exclude these values from summaries and general comparisons of said data. This restricts the ability to draw insights for the given site as well as the precision of the general conclusions, however we can roughly tell that the behavior is similar to those observed in sites 1 and 2, and prediction of these values might be a good motivator for further study.
+
+```{r PROD site 4}
+panel_farms |>
+  _[
+    site == 4, 
+    list(
+      `Rotor Mode` = max(rotor_speed, na.rm = TRUE), 
+      `Nacelle Mode` = max(angle, na.rm = TRUE)
+      )
+    ]
+```
+
+Negative power values are indicative of periods where the site is drawing power from grid due to breakdown or maintenance [1]. Around 8% of observations have such values, but the magnitude of power drawn is insignificant in relation to generation. Patterns in downtime is not the focus of this report, but they may warrant further investigation. On the whole it appears sites 2 and 3 are slightly more susceptible to such readings than sites 1 and 4. It would also be helpful to know the full significance of the magnitude of power consumption.
+
+```{r PROD non-positive}
+panel_farms |>
+  _[
+    !is.na(wind), 
+    list(
+      `Non-Positive Readings` = sum(power <= 0, na.rm = TRUE) / .N, 
+      `Power Drawn` = sum(fifelse(power > 0, 0, power))
+      ), 
+    by = list(Site = site)
+    ]
+```
+
+```{r PROD temp overview}
+panel_rolling |>
+  _[,
+    ggplot(
+      data = .SD,
+      mapping = aes(x = index)
+      ) +
+      geom_line(
+        mapping = aes(y = temp_daily)
+        ) +
+      geom_line(
+        mapping = aes(y = temp_seasonal),
+        colour = "red"
+        ) +
+      facet_wrap(
+        facets = vars(site), ncol = 1
+        ) +
+      labs(
+        x = NULL,
+        y = NULL
+        ) +
+      theme_minimal()
+    ] -> temp_series_chart
+
+panel_farms |>
+  _[,
+    ggplot(
+      data = .SD
+      ) +
+      geom_histogram(
+        mapping = aes(x = temp)
+        ) +
+      facet_wrap(
+        facets = vars(site), nrow = 2
+        ) +
+      labs(
+        x = NULL,
+        y = NULL
+        ) +
+      theme_minimal()
+    ] -> temp_dist_chart
+
+temp_series_chart +
+temp_dist_chart +
+  plot_annotation(
+    title = "Temperature (°C): Daily and monthly average and distribution"
+    )
+```
+
+All sites are subject to similar temperatures and variations in temperature, and the values follow a roughly normal distribution. Overall there is not a significant difference to speak of between the sites, in the general picture as well as in daily or seasonal terms.
+
+```{r PROD rolling timeline & wind ecdf ~ site}
+panel_rolling |>
+  _[,
+    ggplot(
+      data = .SD,
+      mapping = aes(x = index)
+      ) +
+      geom_line(
+        mapping = aes(y = wind_daily)
+        ) +
+      geom_line(
+        mapping = aes(y = wind_seasonal),
+        colour = "blue"
+        ) +
+      facet_wrap(
+        facets = vars(site), ncol = 1
+        ) +
+      labs(
+        x = NULL,
+        y = NULL
+        ) +
+      theme_minimal()
+    ] -> wind_series_chart
+
+panel_farms |>
+  _[,
+    ggplot(
+      data = .SD
+      ) +
+      geom_histogram(
+        mapping = aes(x = wind_speed)
+        ) +
+      facet_wrap(
+        facets = vars(site), nrow = 2
+        ) +
+      labs(
+        x = NULL,
+        y = NULL
+        ) +
+      theme_minimal()
+    ] -> wind_dist_chart
+
+wind_series_chart +
+wind_dist_chart +
+  plot_annotation(
+    title = "Wind (m/s): Daily and monthly averages and distribution"
+    )
+```
+
+With regard to wind speeds, site 3 in Spain differs from the rest as highly variable over time, and subject to greater oscillations and wind speed potential. It also has a very high number of non-windy readings. As wind farms positioned very close together and both in France, site 1 and site 2 are subject to very similar conditions, however it is to be noted that site 2 records significantly more non-windy hours than site 1. Site 4 in Italy follows similar trends as sites 1 and 2, but differs in the overall magnitudes of its values. It has a more peaked distribution with a fatter left tail. Overall it can be said that for windy hours, the magnitude is determined by a right-tailed distribution, which may be approximated by gamma distributions with differing parameters for each site.
+
+```{r PROD speed ~ site + direction}
+panel_farms |>
+  _[
+    wind == TRUE,
+    ggplot(
+      data = .SD
+      ) +
+      stat_summary_bin(
+        mapping = aes(x = direction, y = wind_speed), fun = "mean",
+        geom = "col", fill = "indianred", binwidth = 18
+        ) +
+      scale_x_continuous(
+        name = NULL,
+        limits = c(0, 360), 
+        breaks = seq(from = 0, to = 315, by = 45),
+        labels = cardinal_directions
+        ) +
+      coord_polar(
+        start = 3 * pi / 2, direction = -1
+        ) +
+      facet_wrap(
+        facets = vars(site), nrow = 2
+        ) +
+      labs(
+        title = "Average wind speed (m/s) by direction in sites",
+        y = NULL
+        ) +
+      theme_minimal() +
+      theme(
+        plot.title.position = "plot"
+        )
+    ] -> wind_speed_by_direction
+
+panel_farms |>
+  _[
+    wind == TRUE,
+    ggplot(
+      data = .SD
+      ) +
+      geom_histogram(
+        mapping = aes(x = direction), binwidth = 18, fill = "royalblue"
+        ) +
+      scale_x_continuous(
+        name = NULL,
+        limits = c(0, 360), 
+        breaks = seq(from = 0, to = 315, by = 45),
+        labels = cardinal_directions
+        ) +
+      coord_polar(
+        start = 3 * pi / 2, direction = -1
+        ) +
+      facet_wrap(
+        facets = site, nrow = 2
+        ) +
+      labs(
+        title = "Hourly wind direction distribution in sites",
+        y = NULL
+        ) +
+      theme_minimal() +
+      theme(
+        plot.title.position = "plot",
+        plot.caption.position = "plot",
+        plot.caption = element_text(hjust = 0)
+        )
+    ] -> direction_dist_site
+
+panel_farms |>
+  _[
+    wind == TRUE,
+    ggplot(
+      data = .SD
+      ) +
+      geom_histogram(
+        mapping = aes(x = direction), binwidth = 18, fill = "orange"
+        ) +
+      scale_x_continuous(
+        name = NULL,
+        limits = c(0, 360), 
+        breaks = seq(from = 0, to = 315, by = 45),
+        labels = cardinal_directions
+        ) +
+      coord_polar(
+        start = 3 * pi / 2, direction = -1
+        ) +
+      facet_wrap(
+        facets = time_of_day, ncol = 1
+        ) +
+      labs(
+        title = "Hourly wind direction distribution by time of day",
+        y = NULL
+        ) +
+      theme_minimal() +
+      theme(
+        plot.title.position = "plot",
+        plot.caption.position = "plot",
+        plot.caption = element_text(hjust = 0)
+        )
+    ] -> direction_dist_tod
+
+wind_speed_by_direction +
+direction_dist_site +
+direction_dist_tod +
+  plot_layout(
+    design = c(area(1, 1), area(2, 1), area(1, 2, b = 2))
+    )
+```
+
+The sites are predominantly subject to southbound winds, with a slant towards west in the case of sites 1 and 2, and east in the case of site 4. Wind speeds appear to be considerably higher for site 3, especially for those southbound. Other sites are less fortunate however, with their dominant southbound winds having even less force compared to other directions. The levels for site 4 further confirm its wind speeds are lowest among all sites. It seems that the sites are very episodically subject to strong eastbound winds, but this factors in little for the overall picture. One last thing to note is that site 2 is subject to more and stronger winds bound for northwest than site 1, highlighting the variability of wind direction even in smaller geographical scales.
+
+## Rotor, Wind & Power
+
+```{r PROD 2021 power ~ wind + rotor + site}
+panel_farms |>
+  _[
+    list(TRUE, as.factor(1:3)),
+    ggplot(
+      data = .SD
+      ) +
+      geom_point(
+        mapping = aes(x = wind_speed, y = rotor_speed, colour = power)
+        ) +
+      scale_colour_continuous(
+        name = NULL, guide = NULL, type = "viridis"
+        ) +
+      facet_wrap(
+        facets = vars(site), ncol = 1
+        ) +
+      labs(
+        x = "Wind m/s",
+        y = "Rotor RPM"
+        ) +
+      theme_minimal(),
+    on = list(wind, site)
+    ] -> wind_rotor_dotplot
+```
+
+```{r PROD power ~ wind + rotor}
+panel_farms |>
+  _[
+    site != 4 & wind == TRUE,
+    ggplot(
+      data = .SD
+      ) +
+      stat_summary_2d(
+        mapping = aes(x = wind_speed, y = rotor_speed, z = power),
+        fun = "median"
+        ) +
+      stat_bin_2d(
+        mapping = 
+          aes(
+            label = after_stat(count), alpha = after_stat(count),
+            x = wind_speed, y = rotor_speed,
+            ),
+        geom = "text", colour = "white", size = 3.5
+        ) +
+      scale_fill_continuous(
+        name = "Power (kWh)", type = "viridis"
+        ) +
+      scale_alpha_continuous(
+        name= NULL, guide = NULL
+        ) +
+      labs(
+        x = "Wind m/s",
+        y = "Rotor RPM"
+        ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        legend.title = element_text(vjust = 1, size = 10),
+        legend.position = "bottom",
+        legend.key.height = rel(.5),
+        legend.key.width = rel(2)
+        )
+     ] -> wind_rotor_heatmap
+```
+
+```{r PROD power output overview, fig.width=15}
+wind_rotor_dotplot + 
+wind_rotor_heatmap +
+  plot_annotation(
+    title = "Power output: the correlation between wind and rotor speed",
+    subtitle = "Heatmap to the right is a summary (median, binned) of the data shown in dot plots",
+    caption =
+      paste0(
+        "The numbers on each bin correspond to the observation count.\n",
+        "Due to lack of rotor speed data, site 4 is not included."
+        )
+    ) +
+  plot_layout(
+    guides = "collect",
+    axes = "collect"
+    ) &
+  theme(
+    legend.position = "bottom",
+    plot.subtitle = element_text(face = "italic"),
+    plot.caption = element_text(hjust = 0)
+    )
+```
+
+It appears that the turbines in site 3 are of a different nature than those in sites 1 and 2. Whereas rotor speeds in sites 1 and 2 are little influenced by wind speed, there is a strong linear association in the case of site 3, subject to technical limitations. The difference seems to be that turbines in 1 and 2 are gearbox turbines, which do not require high wind speeds for high power output. In contrast, turbines in site 3 would be traditional designs with rotors that ramp up in response to increasing wind speeds. Turbines in the other sites seem to "kick in" under certain conditions, the presence of wind being only one of them. Gearbox turbines, while capable of generating power even in less windy climates, are more demanding in terms of maintenance than classic designs. Although site 4 is not included in this chart, the prevailing weather conditions, its generation profile and site characteristics lead us to conclude that it also houses gearbox turbines.
+
+We see that site 3 can leverage its high capacity in higher speeds, and is the most responsive to wind speed. A linear relationship between wind speed and rotor speed can be observed up to 10 m/s, at which point the rotor is likely to hit its maximum speed of 12.5 RPM. This rotor speed is maintained up to a wind speed of 20 m/s, at which point turbines start to progressively drop out of operation. It is also notable that power output continues to increase with wind speed even as the rotor is operating at its maximum speed.
+
+For sites 1 and 2, we notice rotor speed value agglomerations at the 7.5 RPM and 12.5 RPM marks. 12.5 RPM seems to be common across sites as the maximum threshold, whereas many 7.5 RPM values seem to be the result of forward-filling. This appears to be largely innocuous as the generation values are consistent with the value expected at those levels. There is also a streak of 9 RPM values in the case of site 2, with higher generation than normal. Overall it can be said that there is weak, if any, correlation between wind speed and rotor speed for those sites. On the other hand, the colors hint at a positive correlation between rotor speed and power output. Together with the clustering at the maximum of 12.5 RPM, it appears that these turbines have a desired operational state where they hit maximum rotor speed and realize most of their capacity. However, the gradual increase in generation from middling to maximum rotor speed levels indicates that interpolation is possible, it is just that these values are rare and seemingly transient.
+
+```{r PROD quantile table}
+copy(panel_farms) |>
+  _[wind == TRUE, Quantile := cut(frank(power, ties.method = "max") / .N, breaks = 5, labels = c("5th", "4th", "3rd", "2nd", "1st"))] |>
+  _[order(Quantile, decreasing = TRUE), list(Quantile, `Total Power (kWh)` = sum(power, na.rm = TRUE)), by = Quantile] |>
+  _[, list(Quantile, `Total Power (kWh)`, Proportion = round(`Total Power (kWh)` / sum(`Total Power (kWh)`), 2))]
+```
+
+Overall power generation is heavily skewed towards hours that have high generation values. The top 40% of power generation values accounts for 70% of the generation in the observed period, and the top 20% accounts for more than half. This suggests that wind generation is not particularly reliable, and should be thought more in terms of intermittent bursts of energy than a steady stream of power output.
+
+```{r PROD direction dist heatmap, fig.height=10}
+panel_farms |>
+  _[
+    wind == TRUE & site != 4,
+    ggplot(
+      data = .SD
+      ) +
+      stat_summary_2d(
+        mapping = aes(x = direction, y = wind_speed, z = cap_util),
+        fun = "mean", fun.args = list(na.rm = TRUE)
+        ) +
+      stat_summary_2d(
+        mapping = aes(label = round(after_stat(value), 2), x = direction, y = wind_speed, z = rotor_speed),
+        fun = "mean", geom = "text", size = 2
+        ) +
+      geom_hline(
+        yintercept = c(6.3, 12.8, 20), colour = c("green", "orange", "indianred"), linetype = "dashed"
+        ) +
+      geom_text(
+        data = data.frame(label = c("6.3 m/s", "12.8 m/s", "20 m/s"), x = c(0, 0, 0), y = c(6.3, 12.8, 20)),
+        mapping = aes(label = label, x = x, y = y),
+        size = 3
+        ) +
+      scale_x_continuous(
+        name = NULL,
+        limits = c(0, 360), 
+        breaks = seq(from = 0, to = 315, by = 45),
+        labels = cardinal_directions
+        ) +
+      coord_polar(
+        start = 3 * pi / 2, direction = -1
+        ) +
+      scale_fill_distiller(
+        name = "Cap. utilization", limits = c(0, 1), breaks = seq(.2, .8, .2), palette = "BuPu", direction = 1
+        ) +
+      labs(
+        title = "Mean rate of capacity utilization by wind direction and speed",
+        subtitle = "Numbers indicate mean rotor speed",
+        caption = "Data from sites 1, 2 and 3 only.",
+        y = NULL
+        ) +
+      theme_minimal() +
+      theme(
+        plot.title.position = "plot",
+        plot.subtitle = element_text(face = "italic"),
+        legend.position = "bottom",
+        legend.key.height = rel(.5),
+        legend.title = element_text(size = 10, vjust = 1),
+        plot.caption.position = "plot",
+        plot.caption = element_text(hjust = 0)
+        )
+    ]
+```
+
+## A Day In the Life of A Wind Farm
+
+```{r PROD hourly wind + power + rotor ~ site + month}
+copy(panel_farms) |>
+  _[
+    site == 4,
+    rotor_speed := NA
+    ] |>
+  _[,
+    `:=`(
+      wind_speed = scale(wind_speed, center = FALSE),
+      rotor_speed = scale(rotor_speed, center = FALSE)
+      ),
+    by = site
+    ] |>
+  _[,
+    ggplot(
+      data = .SD,
+      mapping = aes(x = hour)
+      ) +
+      geom_rect(
+        data = .SD[, list(temp = mean(temp, na.rm = TRUE)), by = list(site, month, hour)],
+        mapping = aes(fill = temp, xmin = hour - .5, xmax = hour + .5, ymin = 0, ymax = 2)
+        ) +
+      stat_summary(
+        mapping = aes(y = rotor_speed),
+        fun = "mean", geom = "line"
+        ) +
+      stat_summary(
+        mapping = aes(y = wind_speed),
+        fun = "mean", geom = "line", colour = "blue"
+        ) +
+      stat_summary(
+        mapping = aes(y = cap_util),
+        fun = "mean", geom = "col", fill = "red", alpha = .7
+        ) +
+      scale_x_continuous(
+        name = NULL, breaks = c(3, 9, 15, 21)
+        ) +
+      scale_y_continuous(
+        name = NULL
+        ) +
+      scale_fill_distiller(
+        name = "Temperature (°C)", palette = "YlGn", direction = -1
+        ) +
+      facet_grid(
+        rows = vars(site), cols = vars(month), switch = "y"
+        ) +
+      labs(
+        title = "Hourly mean scaled values for rotor speed and wind speed (blue)",
+        subtitle = "by site and month",
+        caption = 
+          paste0(
+            "Red columns indicate mean capacity utilization.\n",
+            "Wind speed and rotor speed are scaled at site level.\n",
+            "No rotor speed data available for site 4.\n",
+            "Only 2023 data available for January through March."
+            )
+        ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_blank(),
+        plot.caption = element_text(hjust = 0),
+        strip.text.y.left = element_text(angle = 0),
+        strip.placement = "outside",
+        legend.key.height = rel(.5),
+        legend.position = "bottom",
+        legend.title = element_text(size = 8, vjust = 1)
+        )
+    ]
+```
+
+The wind farms are most efficient on November, December and January, regardless of the type. In contrast, February, June, August and October have the lowest capacity realization values. It is notable how generation profiles of the sites parallel each other, even with differing wind conditions and turbine designs. Capacity utilization remains below 50% for the most part, even in the case of site 2, which leads in terms of efficiency. Despite leading in overall power generation, site 3 realizes less of its capacity in comparison to the gearbox turbine farms.
+
+Another thing that sets site 3 apart is weaker intra-day variability. Other sites experience a spike in wind speed in the noon for most of the year, coinciding with the increase in temperature. This is somehow accompanied by a decrease in power generation, even in the case of site 3 where such a shift is less pronounced. Rotor speed however is either unaffected or remains on an increasing trend. There are several possible explanations:
+
+* Higher temperatures might be an operational constraint that impedes power output.
+* Turbines might be better suited to exploit more stable winds, as hinted by the fact that weak variability in November and December is accompanied by strong generation, although wind speeds are also relatively high.
+* With increased solar generation, the grid may refuse power output by wind farms. Alternatively, the producer might not schedule generation in anticipation of solar output.
+* Power output is stored and dispatched later, for example during the uptick in the afternoon. This possibility would bring into question the methodology of data collection, and invalidate the findings of this report.
+
+```{r PROD time table}
+panel_farms |>
+  _[, list(`Time of Day` = time_of_day, `Total Power (kWh)` = sum(power, na.rm = TRUE)), by = time_of_day] |> 
+  _[, list(`Time of Day`, `Total Power (kWh)`, Proportion = round(`Total Power (kWh)` / sum(`Total Power (kWh)`), 2))]
+```
+
+Speaking of daily variability, for the observed time frame, generation is at its highest during the nighttime hours between 10PM and 3AM, and more or less evenly split among other periods with 10AM-3PM slightly behind. There seems to be a pattern of slight increase in wind speed in the evening, which disappears in the early hours of morning around the 3AM mark. The supply and demand profile may also be better suited for wind generation, with solar generation absent and base load facilities possibly reluctant to dispatch late into the night when demand is low. The slight decrease in 10AM-3PM is in line with the trends observed in above charts, although suggesting that the decrease may be less dramatic than it seems.
+
+## Chasing the Wind
+
+```{r}
+panel_farms |>
+  _[
+    wind == TRUE,
+    ggplot(
+      data = .SD
+      ) +
+      geom_histogram(
+        mapping = aes(x = direction, y = after_stat(ncount), fill = rev(time_of_day)), binwidth = 45, position = "dodge"
+        ) +
+      geom_segment(
+        mapping = aes(x = V1, xend = V2, y = Inf),
+        data = .SD[, list(quantile(angle, .25, na.rm = TRUE), quantile(angle, .75, na.rm = TRUE)), by = list(site, month)]
+        ) +
+      geom_vline(
+        xintercept = seq(22.5, 337.5, by = 45), linetype = rep("dashed", 384)
+        ) +
+      scale_x_continuous(
+        name = NULL,
+        limits = c(0, 360), 
+        breaks = seq(from = 0, to = 315, by = 45),
+        labels = cardinal_directions
+        ) +
+      scale_y_continuous(
+        name = NULL, guide = NULL
+        ) +
+      scale_fill_brewer(
+        name = "Time of day", palette = "YlOrBr"
+        ) +
+      labs(
+        title = "Scaled distributions of wind direction",
+        subtitle = "by site and month",
+        caption = 
+          paste0(
+            "The arc gives the interquartile range of nacelle angle for the given month and site.\n",
+            "Dashed lines indicate wind direction grouping.\n",
+            "No nacelle angle data available for site 4.\n",
+            "Only 2023 data available for January through March."
+            )
+        ) +
+      coord_polar(
+        start = 3 * pi / 2, direction = -1
+        ) +
+      facet_grid(
+        rows = vars(site), cols = vars(month), switch = "y"
+        ) +
+      theme_minimal() +
+      theme(
+        strip.text.y.left = element_text(angle = 0),
+        plot.caption = element_text(hjust = 0),
+        legend.position = "bottom"
+        )
+    ]
+```
+
+To wrap up the report, let us take a look at the nacelle angle policy in each of the sites. We find that at the seasonal level, the angles chosen in the sites parallel each other. Furthermore, there is less variability in nacelle angle in stronger seasons. Overall it can be said that there is a general preference to keep the nacelle angle at the 225-315 degree region and for the most part above 270. In the warmer months, June through October, there is a pattern of 180 degree interquartile ranges, indicating preference for wind capture also in the opposite angle for one reason or another. While it is hard to reach a conclusion regarding reaction to changes in wind direction, it seems that a counter-clockwise advance is maintained most of the time.
+
+```{r PROD angle time series}
+copy(panel_farms) |>
+  _[
+    site == 4,
+    c("rotor_speed", "angle") := NA
+    ] |>
+  _[,
+    `:=`(
+      wind_speed = scale(wind_speed, center = FALSE),
+      rotor_speed = scale(rotor_speed, center = FALSE)
+      ),
+    by = site
+    ] |>
+  _[,
+    ggplot(
+      data = .SD,
+      mapping = aes(x = hour)
+      ) +
+      geom_rect(
+        data =
+          .SD |>
+          _[,
+            list(temp = mean(temp, na.rm = TRUE)),
+            by = list(site, month, hour)
+            ],
+        mapping = aes(xmin = hour - .5, xmax = hour + .5, ymin = 0, ymax = 350, fill = temp)
+        #alpha = .8
+        ) +
+      stat_summary(
+        mapping = aes(y = direction),
+        fun = "mean", geom = "line", colour = "blue"
+        ) +
+      stat_summary(
+        mapping = aes(y = angle),
+        fun = "mean", geom = "line", colour = "orange"
+        ) +
+      stat_summary(
+        mapping = aes(y = rotor_speed * 200),
+        fun = "mean", geom = "line"
+        ) +
+      stat_summary(
+        mapping = aes(y = cap_util * 200),
+        fun = "mean", geom = "col", fill = "red"
+        ) +
+      scale_x_continuous(
+        name = NULL, limits = c(0, 23), breaks = c(4, 10, 16, 22)
+        ) +
+      scale_y_continuous(
+        name = NULL, limits = c(0, 350), sec.axis = sec_axis(transform = ~ . / 200)
+        ) +
+      scale_fill_distiller(
+        name = "Temperature (°C)", palette = "YlGn", direction = -1
+        ) +
+      labs(
+        title = "Hourly mean values for scaled rotor speed, wind direction (blue), nacelle angle (orange)",
+        subtitle = "by site and month",
+        caption = 
+          paste0(
+            "Red columns indicate mean capacity utilization.\n",
+            "Rotor speed is scaled at site level.\n",
+            "No rotor speed or nacelle angle data available for site 4.\n",
+            "Only 2023 data available for January through March."
+            )
+        ) +
+      facet_grid(
+        rows = vars(site), cols = vars(month), switch = "y"
+        ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        plot.caption = element_text(hjust = 0),
+        strip.text.y.left = element_text(angle = 0),
+        strip.placement = "outside",
+        legend.key.height = rel(.5),
+        legend.position = "bottom",
+        legend.title = element_text(size = 8, vjust = .9)
+        )
+    ]
+```
+
+Daily and monthly trends seem to confirm the management decision for maintaining a nacelle orientation ahead of wind direction. In the months of November, December and January, the angle remains constantly above wind direction, and the generation is strong throughout the day. In contrast, in February (2023) when generation is particularly low, nacelle is constantly oriented to remain behind wind direction counter-clockwise. Further supporting factors are the dips in summer months accompanied by lower generation. Interacting effects based on seasonality however can not be ruled out— similar angles are maintained in relation to wind direction in May and October in site 1, however the generation in May is much higher than that in October. August and September values also seem to be less impacted by this supposed interplay between nacelle orientation and wind direction.
+
+```{r PROD difference dotplot}
+panel_farms |>
+  _[,
+    ggplot(
+      data = 
+        copy(.SD) |>
+        _[
+          site != 4 & !is.na(wind_speed) & !is.na(cardinality)
+          ] |>
+        _[, 
+          diff := angle - direction
+          ]
+      ) +
+      geom_point(
+        mapping = aes(x = diff, y = cap_util, colour = site),
+        shape = 20
+        ) +
+      geom_vline(
+        xintercept = c(-180, -90, 90, 180), linetype = "dashed"
+        ) +
+      scale_x_continuous(
+        name = "Difference", limits = c(-200, 200), breaks = c(-180, -90, 0, 90, 180)
+        ) +
+      scale_y_continuous(
+        name = "Capacity utilization (0-1)", guide = NULL
+        ) +
+      scale_colour_brewer(
+        name = "Site", palette = "Dark2", type = "qual"
+        ) +
+      facet_grid(
+        rows = vars(cardinality), 
+        cols = vars(cut(wind_speed, breaks = 4, ordered_result = TRUE)),
+        switch = "y"
+        ) +
+      labs(
+        title = "Nacelle angle with the wind according to cardinality and wind speed (m/s)"
+        ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_blank(),
+        plot.title.position = "plot",
+        strip.text.y.left = element_text(angle = 0)
+        )
+    ] -> angle_dotplot
+```
+
+```{r PROD power & angle ~ cardinality}
+panel_farms |>
+  _[
+    !is.na(cardinality),
+    ggplot(
+      data = .SD
+      ) +
+      stat_summary(
+        mapping = aes(x = cardinality, y = power),
+        fun = "sum", geom = "col", fill = "indianred"
+        ) +
+      facet_wrap(
+        facets = vars(site), nrow = 2, axes = "all_x"
+        ) +
+      labs(
+        title = "Total power generation (kWh) by cardinality",
+        x = NULL,
+        y = NULL
+        ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_blank()
+        )
+    ] -> cardinality_generation
+
+panel_farms |>
+  _[
+    !is.na(cardinality) & site != 4,
+    ggplot(
+      data = .SD
+      ) +
+      stat_summary(
+        mapping = aes(x = cardinality, y = angle - direction),
+        fun = "median", geom = "col", fill = "orange"
+        ) +
+      scale_y_continuous(
+        name = NULL, breaks = seq.int(-135, 135, by = 45)
+        ) +
+      facet_wrap(
+        facets = vars(site), nrow = 2, axes = "all"
+        ) +
+      labs(
+        title = "Nacelle angle with the wind (median) by cardinality",
+        x = NULL,
+        y = NULL
+        ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_blank()
+        )
+    ] -> cardinality_angle
+```
+
+```{r PROD angle plots, fig.width=15}
+angle_dotplot +
+cardinality_generation +
+cardinality_angle +
+  plot_layout(
+    design = c(area(1, 1, 2, 2), area(1, 3), area(2, 3))
+    )
+```
+
+A scatterplot makes the decision-making much more apparent. First we note that wind speed is not a significant factor in orientation choice for sites 1 and 2, whereas site 3 is indifferent regarding orientation at low wind speeds. It does seem that nacelle angle values are fairly static, and the difference is mostly accounted for by the change in wind direction. Sites 1 and 3 behave similarly when there are suitable winds, and site 2 maintains a slightly higher angular magnitude in relation. The sites are seemingly set up to take advantage of southwest-bound winds, at a 45 degree angle. However, there seems to be a decision to be made regarding the exact orientation of the turbine. A 180 degree reversal of its orientation is also suitable for power generation, albeit at less efficiency. It does seem that operators sometimes opt for wind capture in this sense, but it is not immediately clear how much this is dependent on other factors such as wind speed, wind direction etc. We have however noted before that there is greater variability in orientation in summer months. 
+
+With all that said, it is clear that nacelle angle is far from being the only decisive factor for power generation, as evidenced by the fact that readings with similar nacelle angle values have power outputs ranging all over the spectrum. Nevertheless, we can say with some confidence that operators rely on and expect southwest winds regarding turbine orientation.
+
+## Conclusion
+
+We have investigated data from four European wind farms collected in the period of 2021-2023. By making aggregations on the basis of site, month, time of day and wind direction, we have examined power generation, capacity utilization, wind speed, rotor speed and nacelle angle values to better understand wind farm operation and efficiency. Noting the contrast between the sites in France and Spain, we have seen how their generation patterns and environmental conditions differ. Having established daily and seasonal trends, we found that power generation across sites remain similar, in spite of differences in efficiency, operational conditions and climate. We then observed nacelle angle values to look for patterns in operator decision-making, and asserted that operators generally anticipate southwest winds and do not act in a particularly reactive manner.
+
+Based on this report, my current aims are as follows:
+
+* Build a dashboard to enable a more hands-on look at the data.
+* Simulate or model how the sites in France and Spain may behave in each other's environmental conditions, to see if improvements are possible.
+* Build a model for predicting high-output days as well as downtime.
+* Investigate possible shortcomings in site 4 aside from weather conditions, keeping in mind its differing characteristics such as turbine count, capacity etc.
+
+### References
+
+1- Sánchez-Soriano, J.; Paniagua-Falo, P.J.; Gómez Muñoz, C.Q. Historical Hourly Information of Four European Wind Farms for Wind Energy Forecasting and Maintenance. Data 2025, 10, 38. https://doi.org/10.3390/data10030038
